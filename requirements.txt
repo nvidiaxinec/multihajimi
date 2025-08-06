@@ -1,0 +1,8 @@
+gradio
+Pillow
+numpy
+base91
+matplotlib
+seaborn
+pandas
+streamlit
