@@ -25,6 +25,7 @@
 pip install gradio pillow numpy
 ```
 
+或者使用requirements来安装依赖
 *注意：`base91` 库可能需要单独安装或使用其标准实现。请确保你的环境中可以 `import base91`。*
 
 ### 2. 运行程序
