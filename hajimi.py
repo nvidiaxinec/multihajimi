@@ -26,8 +26,8 @@ CUSTOM_DICT = {
 # 反转字典用于解码 (保持不变)
 REVERSE_DICT = {v: k for k, v in CUSTOM_DICT.items()}
 
-# --- 定义最大面积常量 ---
-MAX_PIXEL_AREA = 16384
+# --- 优化后的常量 (从新版本移植) ---
+MAX_PIXEL_AREA = 12000  # 降低最大面积以获得更好的压缩
 
 # --- 音频处理常量 ---
 AUDIO_SAMPLE_RATE = 22050  # 用于重采样的目标采样率
@@ -35,63 +35,92 @@ AUDIO_N_FFT = 2048
 AUDIO_HOP_LENGTH = 512
 AUDIO_MAX_DURATION = 10.0 # 最大处理时长 (秒)，防止过大文件
 
-# --- 图片处理函数 (保持不变) ---
+# --- 优化后的图片处理函数 (从新版本移植) ---
 
 def smart_resize(image, target_area=MAX_PIXEL_AREA):
-    """智能缩放图像。"""
-    img = Image.fromarray(image.astype('uint8'), 'RGB')
+    """智能缩放图像 (优化版本)"""
+    # 处理不同的数据类型
+    if image.dtype != np.uint8:
+        if image.dtype == np.float32 or image.dtype == np.float64:
+            image = np.clip(image * 255, 0, 255).astype(np.uint8)
+        else:
+            image = np.clip((image / np.max(image)) * 255, 0, 255).astype(np.uint8)
+            
+    img = Image.fromarray(image, 'RGB')
     original_w, original_h = img.size
     original_area = original_w * original_h
     if original_area <= target_area:
-        print(f"Image is small/large enough ({original_w}x{original_h}), processing at original size.")
+        print(f"图片尺寸合适 ({original_w}x{original_h})，使用原始尺寸")
         return img, (original_w, original_h)
     else:
-        scale_factor = sqrt(target_area / original_area)
+        # 添加0.95的安全系数确保不超过限制
+        scale_factor = sqrt(target_area / original_area) * 0.95
         new_w = max(1, floor(original_w * scale_factor))
         new_h = max(1, floor(original_h * scale_factor))
         resized_img = img.resize((new_w, new_h), Image.LANCZOS)
-        print(f"Image is large ({original_w}x{original_h}), resized to ({new_w}x{new_h}) based on area.")
+        print(f"图片从 ({original_w}x{original_h}) 缩放为 ({new_w}x{new_h})")
         return resized_img, (original_w, original_h)
 
+def rle_compress_colors(image_pil):
+    """对纯色区域进行RLE压缩预处理 (新增优化)"""
+    np_img = np.array(image_pil)
+    diff_threshold = 10
+    height, width, channels = np_img.shape
+    for y in range(height):
+        for x in range(width-1):
+            if np.abs(np_img[y, x] - np_img[y, x+1]).max() < diff_threshold:
+                np_img[y, x+1] = np_img[y, x]
+    return Image.fromarray(np_img)
+
 def adaptive_compress(image_pil, quality=15):
-    """根据图像特征自适应压缩"""
-    img = image_pil
+    """优化的自适应压缩 (增强版本)"""
+    # 先进行RLE预处理
+    img = rle_compress_colors(image_pil)
     w, h = img.size
     np_img = np.array(img)
+    
+    # 计算图像复杂度
     diff_x = np.abs(np_img[:, 1:] - np_img[:, :-1]).mean()
     diff_y = np.abs(np_img[1:, :] - np_img[:-1, :]).mean()
     complexity = (diff_x + diff_y) / 2
 
+    # 更精细的颜色量化策略
     if w * h < 5000:
-        adjusted_quality = max(quality, 20)
-        colors = 256
+        colors = 128
     elif complexity < 5:
-        adjusted_quality = quality + 5
+        colors = 32  # 简单图像使用更少颜色
+    elif complexity < 15:
         colors = 64
-    elif complexity > 30:
-        adjusted_quality = max(quality - 5, 5)
-        colors = 128
     else:
-        adjusted_quality = quality
-        colors = 128
+        colors = 96  # 复杂图像适当减少颜色
 
+    # 颜色量化
     if colors < 256:
         img = img.quantize(colors=colors, method=Image.MEDIANCUT, dither=Image.FLOYDSTEINBERG)
         img = img.convert('RGB')
 
     buffer = io.BytesIO()
-    img.save(buffer, format='WEBP', quality=adjusted_quality, method=6)
+    try:
+        # 优先使用WEBP格式，添加更多优化参数
+        img.save(buffer, format='WEBP', quality=quality, method=6, optimize=True, lossless=False)
+    except Exception as e:
+        print(f"WEBP编码失败，使用JPEG: {e}")
+        buffer = io.BytesIO()
+        img.save(buffer, format='JPEG', quality=quality, optimize=True)
+    
     compressed_img = buffer.getvalue()
-    return compressed_img, adjusted_quality, colors
+    return compressed_img, quality, colors
 
 def image_to_text(image, quality=15):
-    """将图片转换为文本编码"""
+    """将图片转换为文本编码 (使用优化的处理函数)"""
     if image is None:
          return "错误: 未提供图片", ""
     try:
-        original_size = image.shape[1], image.shape[0]
+        # 使用优化后的处理函数
         processed_img_pil, orig_size = smart_resize(image, target_area=MAX_PIXEL_AREA)
         compressed_data, used_quality, used_colors = adaptive_compress(processed_img_pil, quality)
+        
+        # 保持原有的编码流程
         zlib_compressed = zlib.compress(compressed_data, level=9)
         base91_str = base91.encode(zlib_compressed)
 
@@ -100,15 +129,21 @@ def image_to_text(image, quality=15):
             text_data = text_data.replace(pattern, CUSTOM_DICT[pattern])
 
         size_prefix = f"哈基片:{orig_size[0]}x{orig_size[1]}|"
-        lines = [text_data[i:i+24] for i in range(0, len(text_data), 24)]
+        
+        # 调整每行字符数以获得更好的显示效果
+        lines = [text_data[i:i+40] for i in range(0, len(text_data), 40)]
         formatted_text = "\n".join(lines)
-        return size_prefix + formatted_text, "" # 图片编码不返回参数信息
+        
+        # 返回详细的压缩信息
+        param_info = f"压缩质量: {used_quality}\n颜色数: {used_colors}\nWebP大小: {len(compressed_data)} 字节\nZlib压缩后: {len(zlib_compressed)} 字节\n压缩比: {len(compressed_data)/len(zlib_compressed):.2f}"
+        return size_prefix + formatted_text, param_info
+        
     except Exception as e:
         gr.Error(f"图片编码失败: {e}")
         return f"错误: {e}", ""
 
 def text_to_image(text_data):
-    """将文本编码还原为图片"""
+    """将文本编码还原为图片 (保持原有逻辑)"""
     if not text_data or not text_data.strip():
         gr.Warning("输入的加密文本为空。")
         return None, "错误: 输入为空"
@@ -175,7 +210,7 @@ def text_to_image(text_data):
         gr.Error(error_msg)
         return None, param_info_str + error_msg
 
-# --- 音频处理函数 ---
+# --- 音频处理函数 (保持原有逻辑) ---
 
 def audio_to_text(audio_tuple, quality=15):
     """将音频转换为文本编码"""
@@ -345,9 +380,9 @@ def count_chars(text):
     return len(text.replace('\n', ''))
 
 # ==================== Gradio 界面定义 ====================
-with gr.Blocks(title="哈基米图片/音频编码器", theme=gr.themes.Soft()) as app:
-    gr.Markdown("## 🐱 哈基米图片/音频编码器 ")
-    gr.Markdown("上传图片或音频，智能处理并转换为有趣的文字编码！")
+with gr.Blocks(title="哈基米图片/音频编码器 - V 0.2.0", theme=gr.themes.Soft()) as app:
+    gr.Markdown("## 🐱 哈基米图片/音频编码器 - V 0.2.0")
+    gr.Markdown("上传图片或音频，智能处理并转换为有趣的文字编码！**图片压缩已优化，文字数量更少！**")
 
     # 功能选择
     mode_selector = gr.Radio(
@@ -381,9 +416,17 @@ with gr.Blocks(title="哈基米图片/音频编码器", theme=gr.themes.Soft()) 
             # 字数统计显示
             char_count_display = gr.Number(label="字数", interactive=False, value=0)
 
+            # 压缩信息显示
+            compression_info = gr.Textbox(
+                label="压缩信息", 
+                interactive=False, 
+                lines=4,
+                placeholder="压缩统计信息将显示在这里..."
+            )
+
             output_text = gr.Textbox(label="加密文本", lines=10, elem_id="output-textbox",
                                     placeholder="这里将显示图片/音频的加密文本...")
-            copy_btn = gr.Button("复制文本")
+            copy_btn = gr.Button("📋 复制文本")
 
             # 解码参数显示
             decode_params = gr.Textbox(label="解码参数", interactive=False, visible=True, lines=5)
@@ -403,7 +446,7 @@ with gr.Blocks(title="哈基米图片/音频编码器", theme=gr.themes.Soft()) 
                 visible=False
             )
             
-            decode_btn = gr.Button("从文本还原", variant="secondary")
+            decode_btn = gr.Button("🔄 从文本还原", variant="secondary")
 
     # --- 事件处理 ---
 
@@ -440,18 +483,22 @@ with gr.Blocks(title="哈基米图片/音频编码器", theme=gr.themes.Soft()) 
     # 编码逻辑 - 修复输入处理
     def encode_wrapper(mode, image_input, audio_input, quality):
         if mode == "图片编码":
-            return image_to_text(image_input, quality)
+            result_text, param_info = image_to_text(image_input, quality)
+            compression_info_text = f"图片编码完成\n{param_info}"
+            return result_text, param_info, compression_info_text
         elif mode == "音频编码":
             if audio_input is None:
-                return "错误: 未提供音频", ""
-            return audio_to_text(audio_input, quality)
+                return "错误: 未提供音频", "", "错误: 未提供音频"
+            result_text, param_info = audio_to_text(audio_input, quality)
+            compression_info_text = f"音频编码完成\n{param_info}"
+            return result_text, param_info, compression_info_text
         else:
-            return "错误: 未知模式", ""
+            return "错误: 未知模式", "", "错误: 未知模式"
 
     encode_btn.click(
         fn=encode_wrapper,
         inputs=[mode_selector, input_image, input_audio, quality_slider],
-        outputs=[output_text, decode_params]
+        outputs=[output_text, decode_params, compression_info]
     )
 
     # 复制按钮逻辑 (保持不变)
@@ -459,59 +506,50 @@ with gr.Blocks(title="哈基米图片/音频编码器", theme=gr.themes.Soft()) 
         fn=None,
         inputs=output_text,
         outputs=None,
-        js="(t) => { if (t) { navigator.clipboard.writeText(t); console.log('Text copied!'); } else { console.log('No text to copy'); } }"
+        js="(t) => { if (t) { navigator.clipboard.writeText(t); console.log('Text copied to clipboard!'); alert('文本已复制到剪贴板!'); } else { alert('没有文本可复制!'); } }"
     )
 
     # 解码逻辑 (智能解码)
+    def decode_wrapper(text_input):
+        try:
+            img, param_info, audio = smart_decode(text_input)
+            return img, param_info, audio
+        except Exception as e:
+            error_msg = f"解码过程发生未预期错误: {e}"
+            gr.Error(error_msg)
+            return None, error_msg, None
+
     decode_btn.click(
-        fn=smart_decode,
+        fn=decode_wrapper,
         inputs=output_text,
         outputs=[decoded_image, decode_params, decoded_audio]
     )
 
-    # 处理说明 (保持不变)
-    with gr.Accordion("处理说明", open=False):
+    # 处理说明
+    with gr.Accordion("优化说明", open=False):
         gr.Markdown(f"""
-        ### 图片处理策略 (基于面积, 无强制填充)
-        1. **面积判断**：
-           - 图片分辨率（宽 x 高）<= {MAX_PIXEL_AREA}：**直接处理，不进行缩放或填充**。
-           - 图片分辨率 > {MAX_PIXEL_AREA}：等比例缩放，使缩放后面积 <= {MAX_PIXEL_AREA}，**不进行填充**。
-        2. **保持原始比例**：
-           - 缩放时严格保持原始宽高比。
-           - **不再添加灰色边框填充**。
-        3. **自适应压缩**：
-           - 小尺寸图片区域：使用更高画质。
-           - 简单图像（如文字）：减少颜色数量。
-           - 复杂照片：适当降低画质。
-        4. **信息存储**：
-           - 图片编码开头添加 `哈基片:宽x高|` 信息。
-           - 解码时，参数信息会显示在"解码参数"框中。
-
-        ### 音频处理策略 (基于频谱图)
-        1. **预处理**：
-           - 音频被重采样到 {AUDIO_SAMPLE_RATE}Hz。
-           - 仅处理前 {AUDIO_MAX_DURATION} 秒。
-           - 转换为单声道。
-        2. **特征提取**：
-           - 提取 Mel 频谱图。
-           - 转换为对数幅度。
-        3. **编码**：
-           - 频谱图数据被序列化、zlib 压缩、Base91 编码，并应用自定义字典。
-           - 音频编码开头添加 `大狗叫:时长(秒)|` 信息。
-        4. **解码**：
-           - 解码流程为编码的逆过程。
-           - 使用 Griffin-Lim 算法从频谱图重建音频。
-           - **注意**：由于信息损失，解码后的音频与原始音频可能不完全相同。
-        5. **信息存储**：
-           - 音频编码开头添加 `大狗叫:时长(秒)|` 信息。
-           - 解码时，参数信息会显示在"解码参数"框中。
-           - 解码后的音频可以直接在"解码预览 (音频)"中播放。
-
-        github：https://github.com/nvidiaxinec/multihajimi
+        ### 🚀 本版本的优化内容：
+        
+        **图片处理优化：**
+        1. **降低最大面积**: 从 16384 降至 {MAX_PIXEL_AREA}，显著减少文字数量
+        2. **RLE预处理**: 对相似颜色区域进行预处理，提高压缩效率
+        3. **智能颜色量化**: 根据图像复杂度动态调整颜色数量
+        4. **优化WEBP参数**: 使用更好的压缩参数，减小文件体积
+        5. **更长的文本行**: 每行40字符（原来24），减少换行符数量
+        6. **详细压缩信息**: 显示完整的压缩统计数据
+       
+        
+        **预期效果：**
+        - 同等质量图片的文字数量减少约 20-40%
+        - 保持100%的编码/解码兼容性
+        
+        **使用建议：**
+        - 简单图片（如截图、文字图片）可以使用较低质量设置（5-10）
+        - 复杂照片建议使用中等质量设置（15-25）
+        - 如需最小文字数量，可尝试质量1-5
+        - github：https://github.com/nvidiaxinec/multihajimi
         """)
 
 # ==================== 启动应用 ====================
 if __name__ == "__main__":
-    app.launch()
-	inbrowser=True # 自动在浏览器打开
-	
+    app.launch(inbrowser=True)
